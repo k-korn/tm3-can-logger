@@ -37,9 +37,7 @@ As a result, RPI has address of 5.4.3.1 and clients use 5.4.3.xx range.
 
 ## Data Flow
 CAN data is obtained by "candump" utility, launched with a set of filters to match only messages we need.
-
 It is then processed by can-logger.pl script, which used DBC-like data descriptions to extract data from binary signals.
-
 Perl script publishes results to Mosquitto MQTT broker, which has couple of very useful features:
  - WebSocket protocol support 
  - Ability to act as a simple HTTP server (by http_dir config option), eliminating the need for actual HTTP server like Nginx.
