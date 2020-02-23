@@ -1,0 +1,42 @@
+#!/bin/sh -e
+#
+# rc.local
+#
+# This script is executed at the end of each multiuser runlevel.
+# Make sure that the script will "exit 0" on success or any other
+# value on error.
+#
+# In order to enable or disable this script just change the execution
+# bits.
+#
+# By default this script does nothing.
+
+# Print the IP address
+#modprobe g_mass_storage file=/data/sdcard stall=0 iSerialNumber='0123456' removable=1
+echo conservative  > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+tvservice -o
+
+#kill ether
+echo -n '1-1.1.1:1.0' > /sys/bus/usb/drivers/lan78xx/unbind
+/usr/sbin/uhubctl -l 1-1.1 -p 1 -a 0
+
+#wlan power
+iwconfig wlan0 txpower 10
+
+#RT prio
+#lower for USB
+pgrep dwc_otg | xargs -n 1 chrt -f -p 30
+
+#higher for SPI
+pgrep spi | xargs -n 1 chrt -f -p 99
+
+#Higner for mcp251x
+pgrep mcp251x |  xargs -n 1 chrt -f -p 99
+
+
+
+#rfcomm bind rfcomm0 aa:bb:cc:11:22:33
+#ip link set can0 up type can bitrate 500000
+
+
+exit 0

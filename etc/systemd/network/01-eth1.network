@@ -1,0 +1,10 @@
+[Match]
+Name=eth1
+
+[Link]
+RequiredForOnline=yes
+
+[Network]
+DHCP=yes
+DNS=1.1.1.1
+IPForward=yes

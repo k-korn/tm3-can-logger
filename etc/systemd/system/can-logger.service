@@ -1,0 +1,15 @@
+[Unit]
+Description=Tesla CAN logger
+After=network.target rc-local.service
+Wants=rc-local.service 
+
+[Service]
+User=root
+ExecStart=/usr/local/sbin/can-logger.pl
+
+# Restart every >2 seconds to avoid StartLimitInterval failure
+RestartSec=30
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
