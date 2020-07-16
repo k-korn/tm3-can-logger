@@ -1,7 +1,7 @@
 [Unit]
 Description=Tesla CAN logger
-After=network.target rc-local.service
-Wants=rc-local.service 
+After=network.target rc-local.service time-sync.target
+Wants=rc-local.service time-sync.target
 
 [Service]
 User=root

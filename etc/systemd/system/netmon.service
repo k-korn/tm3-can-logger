@@ -1,0 +1,17 @@
+[Unit]
+Description=Modem Status Monitor
+After=network.target rc-local.service ssh-home.service network-online.target
+Requires=rc-local.service ssh-home.service
+Wants=network-online.target
+
+
+[Service]
+User=root
+ExecStart=/usr/local/sbin/netmon.pl
+
+# Restart every >2 seconds to avoid StartLimitInterval failure
+RestartSec=30
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
