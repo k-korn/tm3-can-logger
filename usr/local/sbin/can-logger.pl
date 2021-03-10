@@ -1,15 +1,11 @@
 #!/usr/bin/perl
-#
-# Tesla CAN logger 
-# © 2020 Korn
-# 
-
 use 5.010;
 use Data::Dumper;
-#use Zabbix::Sender;  # Uncomment all "sender" mentions for Zabbix integration.
+use Zabbix::Sender;
 use Net::MQTT::Simple;
 use Time::HiRes qw(gettimeofday tv_interval time);
 use experimental qw( switch );
+use List::Util qw(first none);
 
 my $res;
 my $t_now = 0;
@@ -19,6 +15,9 @@ my $t_mqtt = 0;
 my $t_cons = 0;
 my $t_flash = 0;
 my $db_prev = 0;
+my $brick_sum = 0;
+my $brick_cnt = 0;
+my $mqtt_sent;
 
 #Defines
 my $SEND_FREQ_IDLE =  30;
@@ -79,9 +78,31 @@ my $bms_wakeup_reasons = {
 	"5" => "Want to Warm"
 };
 
+my $veh_states = {
+	"0" => "Init",
+	"1" => "LP Standby",
+	"2" => "Silent Wake",
+	"3" => "Batt Post Wake",
+	"4" => "Sys Checks",
+	"5" => "Sleep Shut",
+	"6" => "Sleep Stdby",
+	"7" => "LV Shut",
+	"8" => "LV Awake",
+	"9" => "HV UP Stdby",
+	"10" => "Accsry",
+	"11" => "Accsry +",
+	"12" => "Conditioning",
+	"13" => "Drive",
+	"14" => "Crash",
+	"15" => "OTA",
+	"16" => "Turn On Rails",
+	"17" => "Reset"
+};
+
 #Precision of displayed values
 my $precision = {
 	dis_lim => 0,
+	reg_lim => 0,
 	cur_use => 0,
 	trip_regper => 0,
 	trip_cpu => 0,
@@ -89,8 +110,11 @@ my $precision = {
 	trip_hvac => 0,
 	trip_other => 0,
 	trip_drive => 0,
+	trip_sys   => 0,
 	elev_delta => 0,
 	dis_kmh => 0,
+	hvac_rpm => 0,
+	chg_volt => 0,
 	trip_rate => 1,
 
 	temp_12 => 1,
@@ -105,19 +129,25 @@ my $precision = {
 	rear_p => 1,
 	sys_heat_cur => 1,
 	cur_speed => 1,
+	bat_kw_min => 1,
+	bat_kw_max => 1,
+	bc_vminus => 1,
+	bc_vplus => 1,
 	time_30 => 3,
 	time_50 => 3,
-	time_100 => 3
+	time_100 => 3,
+	pow_lv => 3,
 
 };
 
 #What to receive 
-my @IDs = qw(118 132 20C 312 21D 241 243 252 257 261 264 266 268 287 2D2 2F2 315 321 332 336 33A 352 3A1 3B6 3D2 3D8 3F2 3F5 3FE 473  541);
+my @IDs = qw(118 132 20C 312 21D 241 243 252 257 261 264 266 268 282 287 2B4 2D2 2E1 2F2 315 321 32C 332 336 33A 352 3A1 3B6 3D2 3D8 3F2 3F5 3FE 401 473  541);
 
 my $sender = Zabbix::Sender->new({
         'server' => 'localhost',
         'port' => 10051,
         'hostname' => 'teslapi',
+	'timeout' => 2
         });
 
 
@@ -151,6 +181,8 @@ if (/id="(.*?)"/) {
 my $id = $1;
 $mqtt_ids->{$id} = 1;
 }
+$mqtt_ids->{'drive_state'} = 1;
+$mqtt_ids->{'chg_type'} = 1;
 }
 close IHT;
 
@@ -187,12 +219,14 @@ $dcnt++;
 
 chomp;
 #print "l: $_\n";
+#my ($ts,$id,$data_txt) = $_ =~ /^\s+\((\S+)\)\s+can0\s+([0-9A-F]{3})\s+\[\d\]\s+([0-9A-F ]+).*/;
 my ($ts,$id,$data_txt) = $_ =~ /^\((\S+)\) can0 ([0-9A-F]{3})#([0-9A-F ]+)/;
 next if !defined $id;
 
+#$ts =~ s/\.//g;
 $ts =~ tr/.//d;
 $ts .= '000';
-#print "$ts: $id $data_txt\n";
+#print "$ts: $id $data_txt\n"; next;
 
 #We're awake, send this
 if ($sleeping == 2) {
@@ -206,6 +240,10 @@ if ($sleeping == 2) {
 
 
 #print "id: |$id| data: |$data_txt|\n";
+#my @d = split / /, $data_txt;
+#@d = map { hex($_) } @d;
+#print Dumper([@data]);
+#my $dbin = unpack('Q',pack('cccccccc',@d));
 $data_txt = join '', reverse split /(..)/, $data_txt;
 my $dbin = hex($data_txt);
 
@@ -238,11 +276,13 @@ if ($t_now - $t_dump > $DUMP_FREQ) {
 		$res->{trip_hvac}->{avg} = $joules->{hvac} / 3600;
 		$res->{trip_evap}->{avg} = $joules->{evap} / 3600;
 		$res->{trip_drive}->{avg}  = $joules->{drive}  / 3600;
+		$res->{trip_sys}->{avg}  = $joules->{sys_heat} / 3600;
 		$res->{trip_used}->{avg} =  $dis_delta;
 		$res->{trip_regen}->{avg} = $chg_delta;
 		$res->{trip_driven}->{avg} =  $odo_delta;
 		#other usage.
 		$res->{trip_other}->{avg} = $dis_delta - ($res->{trip_cpu}->{avg} + $res->{trip_hvac}->{avg} + $res->{trip_evap}->{avg} + $res->{trip_drive}->{avg});
+		$res->{trip_other}->{avg} = 0 if $res->{trip_other}->{avg} < 0;
 
 		#Regen percent, if discharge is >0
 		if ($dis_delta > 0) {
@@ -270,16 +310,16 @@ if ($t_now - $t_dump > $DUMP_FREQ) {
 	for my $id (sort keys %$res) {
 	my $val = (defined $res->{$id}->{val} && $res->{$id}->{cnt} > 0) ? $res->{$id}->{val} / $res->{$id}->{cnt} : $res->{$id}->{avg};
 	#next if !defined($res->{$id}->{avg});
-	$out .= sprintf("%s: %0.2f\n",$id,$val);
+	$out .= sprintf("%s: %0.3f\n",$id,$val);
 	$i++
 	}
 	$out .= "\n";
 	for my $id (sort keys %$ps) {
-		$out .=  sprintf("ps| %s: %0.2f\n",$id,$ps->{$id});
+		$out .=  sprintf("ps| %s: %0.3f\n",$id,$ps->{$id});
 	}
 	$out .= "\n";
 	for my $id (sort keys %$joules) {
-			$out .=  sprintf("j| %s: %0.2f\n",$id,$joules->{$id});
+			$out .=  sprintf("j| %s: %0.3f\n",$id,$joules->{$id});
 	}
 
 	#print "Dumping $i values\n";
@@ -297,7 +337,7 @@ if ($t_now - $t_dump > $DUMP_FREQ) {
 if ($t_now - $t_mqtt > $DUMP_FREQ) {
         for my $id (sort keys %$res) {
 		my $val = (defined $res->{$id}->{val} && $res->{$id}->{cnt} > 0) ? $res->{$id}->{val} / $res->{$id}->{cnt} : $res->{$id}->{avg};
-		send_mqtt($id,$val) if defined $mqtt_ids->{$id};;
+		send_mqtt('ui',$id,$val) if defined $mqtt_ids->{$id};;
 
         }
 	$t_mqtt = $t_now;
@@ -319,16 +359,17 @@ if ($t_now - $t_sent > $SEND_FREQ) {
 	# Send to Zabbix
 	for my $id (sort keys %$res) {
 		next if !defined $res->{$id}->{avg};
-#		$sender->bulk_buf_add([$id,$res->{$id}->{avg},int($t_now)]);
+		$sender->bulk_buf_add([$id,$res->{$id}->{avg},int($t_now)]);
 	}
-#	$sender->bulk_buf_add(['sleeping',$sleeping,int(time())]);
-#	$sender->bulk_send;
+	$sender->bulk_buf_add(['sleeping',$sleeping,int(time())]);
+	$sender->bulk_send;
 
 	$t_sent = $t_now;
 	$ps->{fps} = $dcnt / $SEND_FREQ;
 	$dcnt = 0;
 
 	undef $res;
+	savedata();
 
 
 } #Zabbix end
@@ -372,8 +413,9 @@ when('118') { # Drive State
 			}
 			$smsg .= sprintf("Used: %0.0f Wh\n",$res->{trip_used}->{avg});
 			$smsg .= sprintf("Drive: %0.0f Wh\n",$res->{trip_drive}->{avg}) if $res->{trip_drive}->{avg} > 0;
-			$smsg .= sprintf("HVAC: %0.0f Wh\n",$res->{trip_hvac}->{avg}) if $res->{trip_hvac}->{avg} > 0;
+			$smsg .= sprintf("HEAT: %0.0f Wh\n",$res->{trip_hvac}->{avg}) if $res->{trip_hvac}->{avg} > 0;
 			$smsg .= sprintf("EVAP: %0.0f Wh\n",$res->{trip_evap}->{avg}) if $res->{trip_evap}->{avg} > 0;
+			 $smsg .= sprintf("SYS: %0.0f Wh\n",$res->{trip_sys}->{avg}) if $res->{trip_sys}->{avg} > 0;
 			$smsg .= sprintf("CPU: %0.0f Wh\n",$res->{trip_cpu}->{avg});
 			$smsg .= sprintf("Other: %0.0f Wh\n",$res->{trip_other}->{avg});
 			$smsg .= sprintf("Elev. Delta: %0.0f m",$res->{elev_delta}->{avg});
@@ -408,7 +450,10 @@ when('132') { # Battery status
 	next if $bi > 800;
 
 	#Battery current raw 
-	my $br = -1 *  getbits($dbin,'32|16@1- (0.05,-500)') ;
+	my $br = -1 *  getbits($dbin,'32|16@1- (0.05,-822)') ;
+
+	#fix
+	#$br = $bi;
 
 	#Battery power, calculated.
 	my $bp = $br * $bv;
@@ -418,10 +463,10 @@ when('132') { # Battery status
 
 	if (abs($bp) > 1000) {
 		$precision->{bat_kw} = 1;
-		$bp_averager = 4;
+		$bp_averager = 2;
 	} else {
 		$precision->{bat_kw} = 3;
-		$bp_averager = 128;
+		$bp_averager = 64;
 
 
 	}
@@ -440,18 +485,13 @@ when('132') { # Battery status
 	$res->{bat_p}->{cnt}++;
 	
 	$ps->{bat_kw_avg} = (($bp_averager - 1) * $ps->{bat_kw_avg} + $bp/1000) / $bp_averager;
-	my $bat_kw_rnd =  5 / 1000 * int($ps->{bat_kw_avg} * 1000 / 5 + 0.5);# if ($ps->{bat_kw_avg} < 1);
+	my $bat_kw_rnd =  2 / 1000 * int($ps->{bat_kw_avg} * 1000 / 2 + 0.5);# if ($ps->{bat_kw_avg} < 1);
 	$ps->{bat_kw} = $bp/1000;
 	$ps->{bat_kw_min} = $ps->{bat_kw} if $ps->{bat_kw} < $ps->{bat_kw_min};
 	$ps->{bat_kw_max} = $ps->{bat_kw} if $ps->{bat_kw} > $ps->{bat_kw_max};
-	send_mqtt("dis_kmh",sprintf("%3.1f",$ps->{bat_kw_avg} / 0.136));
-	send_mqtt("bat_kw",sprintf("%02.".$precision->{bat_kw}."f",$bat_kw_rnd));
-	send_mqtt("bat_kw_min",$ps->{bat_kw_min});
-	send_mqtt("bat_kw_max",$ps->{bat_kw_max});
-	#$mqtt->publish("dis_kmh"=> sprintf("%3.1f",$bp/130));
-	#$mqtt->publish("bat_kw"=> sprintf("%02.2f",$ps->{bat_kw_avg}));
-	#$mqtt->publish("bat_i"=> sprintf("%0.2f",$br));
-	#$mqtt->publish("bat_v"=>sprintf("%0.2f",$bv));
+	send_mqtt('ui',"bat_kw",sprintf("%02.".$precision->{bat_kw}."f",$bat_kw_rnd));
+	send_mqtt('ui',"bat_kw_min",$ps->{bat_kw_min});
+	send_mqtt('ui',"bat_kw_max",$ps->{bat_kw_max});
 
 
 
@@ -532,11 +572,11 @@ when('252') { # Power limits
 
 
 	#print "rlim: $rlim dlim: $dlim\n";
-	$res->{reg_lim}->{val} += $rlim;
-	$res->{reg_lim}->{cnt}++;
+	$res->{reg_lim}->{avg} = $rlim;
 
-	$res->{dis_lim}->{val} += $dlim;
-	$res->{dis_lim}->{cnt}++;
+	$res->{dis_lim}->{avg} = $dlim;
+
+
 
 }
 when('257') { # Speed
@@ -544,13 +584,13 @@ when('257') { # Speed
 	my $speed = getbits($dbin,'12|12@1+ (0.08,-40)');
 	$res->{cur_speed}->{avg} = $speed;
 	$ps->{speed_avg} = (63 * $ps->{speed_avg} + $speed) / 64;
-	send_mqtt("cur_speed", sprintf("%3.1f",$speed));
+	send_mqtt('ui',"cur_speed", sprintf("%3.1f",$speed));
 
 	#Instant usage
 	if ($speed > 2) {
 		$res->{cur_use}->{avg} = 1000 * $ps->{bat_kw_avg} / $ps->{speed_avg};
 		$res->{cur_use}->{avg} = 1999 if $res->{cur_use}->{avg} > 1999;
-		send_mqtt('cur_use',$res->{cur_use}->{avg});
+		send_mqtt('ui','cur_use',$res->{cur_use}->{avg});
 	}
 
 	# 0-60, set zero
@@ -565,14 +605,14 @@ when('257') { # Speed
 	foreach (30, 50, 100) {
 		if (($speed > $_) && ($delta < 20) && ($ps->{"time_".$_} == 0)) {
 			$ps->{"time_".$_} = $delta;
-			 send_mqtt("time_".$_, sprintf("%0.3f",$delta));
+			 send_mqtt('ui',"time_".$_, sprintf("%0.3f",$delta));
 		}
 	}
 
 
 }
 
-when('261') { # 12v batt
+when('261z') { # 12v batt, broken in 2021.4.11
 	#print "ID 261: $data_txt\n";
 
 
@@ -598,16 +638,17 @@ when('264') { # Charger stats
 	my $chg_volt = getbits($dbin,'0|14@1+ (0.033,0)');
 	my $chg_curr = getbits($dbin,'14|9@1+ (0.1,0)');
 	my $chg_pow = getbits($dbin,'24|8@1+ (0.1,0)');
+	$chg_volt = 0 if $chg_volt < 20;
 
 	#print "chg v: $chg_volt i: $chg_curr p: $chg_pow\n";
 	
 	$res->{chg_curr}->{val} += $chg_curr;
 	$res->{chg_curr}->{cnt}++;
-	$res->{chg_volt}->{val} += $chg_volt;
-	$res->{chg_volt}->{cnt}++;
+	$res->{chg_volt}->{avg} = $chg_volt;
 	$res->{chg_pow}->{val} += $chg_pow;
 	$res->{chg_pow}->{cnt}++;
 	$ps->{chg_volt} = $chg_volt;
+	#print "cv: $chg_volt cp now: $chg_pow prev: $ps->{chg_pow_prev}\n" if $chg_pow > 0.1;
 
 
 }
@@ -628,7 +669,7 @@ when('266') { # Rear power
 	$res->{rear_heat}->{cnt} ++;
 	$res->{rear_heat_opt}->{avg} = $rear_heat_opt;
 	$res->{rear_heat_max}->{avg} = $rear_heat_max;
-	send_mqtt("rear_p",sprintf("%3.2f",$rear_p));
+	send_mqtt('ui',"rear_p",sprintf("%3.2f",$rear_p));
 	#$mqtt->publish("rear_p"=> sprintf("%3.2f",$rear_p));
 	$last_seen->{rear_p} = $t_now;
 
@@ -651,10 +692,38 @@ when('268') { # Sys power, heat
 	my $sys_heatcurr = getbits($dbin,'8|8@1+ (0.08,0)');
 	my $sys_drivemax = getbits($dbin,'16|9@1+ (1,0) ');
 	my $sys_regmax   = getbits($dbin,'32|8@1+ (1,-100)');
+	#$sys_heatcurr = 0.3;
 
 	#print "SYS heat max: $sys_heatmax curr: $sys_heatcurr drivemax: $sys_drivemax regen max: $sys_regmax\n";
 	 $res->{sys_heat_cur}->{avg} = $sys_heatcurr;
 	 $last_seen->{sys_heat_cur} = $t_now;
+	$res->{sys_max_drv}->{avg} = $sys_drivemax;
+	$res->{sys_max_reg}->{avg} = $sys_regmax;
+	$last_seen->{sys_max_drv} = $t_now;
+	$last_seen->{sys_max_reg} = $t_now;
+
+	#Sys Heat accounting
+	if (defined $ptimes->{sys_heat}) {
+		my $tdelta = tv_interval($ptimes->{sys_heat});
+		#print "td: $tdelta\n";
+		$joules->{sys_heat} += 1000 * $sys_heatcurr * $tdelta ;
+		$ptimes->{sys_heat} = [gettimeofday];
+	} else {
+		$ptimes->{sys_heat} = [gettimeofday];
+	}
+}
+
+when('282') { # HVAC Blower
+	my $hvac_idx = getbits($dbin,'0|2@1+ (1,0)');
+	if ($hvac_idx == 0) {
+		my $hvac_rpm =  getbits($dbin,'20|10@1+ (10,0)');
+		my $hvac_enabled = getbits($dbin,'2|1@1+ (1,0)');
+		#print "hvac rpm: $hvac_rpm\n";
+	        $res->{hvac_rpm}->{val} += $hvac_rpm;
+        	$res->{hvac_rpm}->{cnt} ++;
+
+
+	}
 }
 
 when('287') { # PTC Cabin Heater
@@ -685,6 +754,21 @@ when('287') { # PTC Cabin Heater
 	}
 
 }
+when('2B4') { #DC-DC stats
+	#dcdc volt
+	my $dcdc_volt = getbits($dbin,'0|10@1+ (0.0390625,0)');
+	my $dcdc_curr = getbits($dbin,'24|12@1+ (0.1,0)');
+	my $dcdc_p = sprintf('%0.2f',$dcdc_volt * $dcdc_curr / 0.95);
+	#print "dcdc_p: $dcdc_p\n";
+        $res->{pow_lv}->{val} += $dcdc_p/1000;
+        $res->{pow_lv}->{cnt} ++;
+	$res->{pow_hv}->{val} += $ps->{bat_kw} - $dcdc_p/1000;
+        $res->{pow_hv}->{cnt} ++;
+	#print "lv $dcdc_p hv ".$ps->{bat_kw_avg}."\n";
+
+
+	
+}
 
 when('2D2') { #BMS stats
 	#print "ID 2D2: $data_txt\n";
@@ -702,17 +786,29 @@ when('2D2') { #BMS stats
 
 }
 
+when('2E1') { #VCFront Status 
+	my $vcstat_idx = getbits($dbin,' 0|3@1+ (1,0)');
+	if ($vcstat_idx == 1) {
+		my $veh_state = getbits($dbin,'8|5@1+ (1,0)');
+		#print "Veh State: $veh_state, $veh_states->{$veh_state} \n";
+		$res->{veh_state}->{avg} = $veh_state;
+		 send_mqtt('ui','veh_state_txt',$veh_states->{$veh_state});
+	}
+
+}
+
 when('2F2') { # BMS wake reasons
 	my $bms_r_keep = getbits($dbin,'4|3@1+ (1,0)');
 	my $bms_r_wake = getbits($dbin,'8|3@1+ (1,0)');
 
 	$res->{bms_r_keep}->{avg} = $bms_r_keep;
 	$res->{bms_r_wake}->{avg} = $bms_r_wake;
-	send_mqtt("bms_r_kw",$bms_keepawake_reasons->{$bms_r_keep});
-	send_mqtt("bms_r_w",$bms_wakeup_reasons->{$bms_r_wake});
+	send_mqtt('ui',"bms_r_kw",$bms_keepawake_reasons->{$bms_r_keep});
+	send_mqtt('ui',"bms_r_w",$bms_wakeup_reasons->{$bms_r_wake});
+	#print "changed $ps->{bms_r_keep_prev} > $bms_r_keep, kwl: $ps->{kw_left}\n";
 
-	if ($ps->{bms_r_keep_prev} eq '6' && $bms_r_keep ne $ps->{bms_r_keep_prev}) {
-		print "BMS Keep changed $ps->{bms_r_keep_prev} > $bms_r_keep\n";
+	if ($ps->{bms_r_keep_prev} eq '6' && $bms_r_keep ne $ps->{bms_r_keep_prev} && $ps->{kw_left} < 0.2) {
+		print "BMS Keep changed $ps->{bms_r_keep_prev} > $bms_r_keep, kwl: $ps->{kw_left}\n";
                 my $smsg = "Charging done: \n";
                 $smsg .= sprintf("Range: %0.2f km (%0.2f full)\n",$res->{km_exp}->{avg},$res->{km_full}->{avg});
                 $smsg .= sprintf("Percent: %0.2f%%\n",$res->{bat_usable}->{avg});
@@ -755,6 +851,25 @@ when('321') { #VCFront Sensors
 	$res->{temp_cpi}->{avg} = $temp_cpi;
 	$res->{temp_amb}->{avg} = $temp_amb;
 
+}
+
+when('32C') { # ChargePort Temps
+
+	my $cc_mux = getbits($dbin,'0|8@1+ (1,0)');
+	if ($cc_mux == 0) {
+		my $temp_cc1 = getbits($dbin,'16|8@1- (1,88)');
+		my $temp_cc2 = getbits($dbin,'24|8@1- (1,88)');
+		my $temp_cc3 = getbits($dbin,'32|8@1- (1,88)');
+		my $temp_cc4 = getbits($dbin,'44|8@1- (1,88)');
+	        $res->{temp_cc1}->{val} += $temp_cc1;
+        	$res->{temp_cc1}->{cnt} ++;
+		$res->{temp_cc2}->{val} += $temp_cc2;
+                $res->{temp_cc2}->{cnt} ++;
+		$res->{temp_cc3}->{val} += $temp_cc3;
+                $res->{temp_cc3}->{cnt} ++;
+		$res->{temp_cc4}->{val} += $temp_cc4;
+                $res->{temp_cc4}->{cnt} ++;
+	}
 }
 
 when('332') { #BMS min/max cell stats
@@ -816,7 +931,7 @@ when('352') { #BMS Energy Status
 	my $kw_rem  = getbits($dbin,'11|11@1+ (0.1,0)');
 	my $kw_exp  = getbits($dbin,'22|11@1+ (0.1,0)');
 	my $kw_ideal= getbits($dbin,'33|11@1+ (0.1,0)');
-	#my $kw_unk  = getbits($dbin,'44|11@1+ (0.1,0)');
+	my $kw_left  = getbits($dbin,'44|11@1+ (0.1,0)');
 	my $kw_buf  = getbits($dbin,'55|8@1+ (0.1,0)');
 
 	#print "kw_full: $kw_full kw_rem: $kw_rem exp: $kw_exp ideal: $kw_ideal unk: $kw_unk buf $kw_buf\n";
@@ -825,14 +940,15 @@ when('352') { #BMS Energy Status
 	$res->{kw_exp}->{avg} = $kw_exp;
 	$res->{kw_ideal}->{avg} = $kw_ideal;
 	$res->{kw_buf}->{avg} = $kw_buf;
-	#$res->{kw_unk}->{avg} = $kw_unk;
+	$res->{kw_left}->{avg} = $kw_left;
+	$ps->{kw_left} = $kw_left;
 
 	# Derivatives
 	$res->{km_rem}->{avg} = ($kw_rem - $kw_buf) / 0.13;
 	$res->{km_exp}->{avg} = ($kw_exp - $kw_buf) / 0.13;
 	$res->{km_full}->{avg} = ($kw_full - $kw_buf) / 0.13;
 	$res->{km_frozen}->{avg} = ($kw_rem - $kw_exp) / 0.13;
-	$res->{km_frozen}->{avg} = 0 if (abs($res->{km_frozen}->{avg}) < 1);
+	#$res->{km_frozen}->{avg} = 0 if (abs($res->{km_frozen}->{avg}) < 1);
 	$res->{bat_usable}->{avg} = 100 * ($kw_exp - $kw_buf) / ($kw_full - $kw_buf);
 	$res->{bat_frozen}->{avg} = 100 * ($kw_rem - $kw_exp) / ($kw_full - $kw_buf);
 
@@ -887,9 +1003,14 @@ when('3F2') { #KWh Counters
 		2 => 'kwh_regen',
 		3 => 'kwh_drive'
 	};
-        my $mux = getbits($dbin,'0|3@1+ (1,0)');
-	$res->{$muxers->{$mux}}->{avg} = getbits($dbin,'8|32@1+ (0.001,0)');
-	#print "mux $muxers->{$mux} val $res->{$muxers->{$mux}}->{avg}\n";
+        my $mux = getbits($dbin,'0|4@1+ (1,0)');
+	if (defined $muxers->{$mux}) {
+		my $muxval = getbits($dbin,'8|32@1+ (0.001,0)');
+		if ($muxval < 100000) {
+			$res->{$muxers->{$mux}}->{avg} = $muxval;
+			#print "mux $muxers->{$mux} val $res->{$muxers->{$mux}}->{avg}\n";
+		}
+	};
 
 }
 
@@ -899,13 +1020,13 @@ when('3F5') { # Lighting status
 	#print "db: $dbin\n";
 	
 	if ($dbin == 0)  {
-	my $td = $t_now - $t_flash;
-	if ($db_prev != $dbin && $td < 5 && $td > 0.7) {
+	my $td = sprintf("%.1f",$t_now - $t_flash);
+	if ($db_prev != $dbin && $td < 5 && $td > 0.001) {
 		print "Flashed for $td seconds\n";
 	};
 
-	if ($db_prev != $dbin && $td < 2 && $td > 0.7) {
-		send_msg("blink");
+	if ($db_prev != $dbin && $td < 2 && $td > 0.001) {
+		send_msg("blink ($td)");
 	}
 	$t_flash = $t_now;
 	} else {
@@ -930,6 +1051,65 @@ when('3FE') { #Brake temps
 	$res->{btemp_rr}->{avg} = $btemp_rr;
 }
 
+when('401') { # Brick voltages
+	#print "ID 401: $data_txt\n";
+	my $brick_mux = getbits($dbin,' 0|8@1+ (1,0)');
+	my $bv_0 = getbits($dbin,'16|16@1+ (0.0001,0)');
+	my $bv_1 = getbits($dbin,'32|16@1+ (0.0001,0)');
+	my $bv_2 = getbits($dbin,'48|16@1+ (0.0001,0)');
+	my $cid_start = 3 * $brick_mux;
+
+	if ($bv_0 > 1) {
+
+		$res->{bc_vavg}->{avg} = $bv_0 if !defined $res->{bc_vavg}->{avg};
+	        my $bc_vmin = $res->{bc_vmin}->{avg};
+		next if $bc_vmin eq '';
+		#$bc_vmin = 3.8 if $bc_vmin eq '';
+	        my $bc_vmax = $res->{bc_vmax}->{avg};
+		#$bc_vmax = 4.2 if $bc_vmax eq '';
+		my $bc_mindiff = 10/1000; # minimum alertable disbalance
+		if ($bc_vmax - $bc_vmin <$bc_mindiff) {
+			$bc_med = ($bc_vmax + $bc_vmin) / 2;
+			$bc_floor = $bc_med - $bc_mindiff/2;
+			$bc_ceil  = $bc_med + $bc_mindiff/2;
+		} else {
+			$bc_floor = $bc_vmin;
+			$bc_ceil  = $bc_vmax;
+		}
+		#$bc_vmin -= 0.0005;
+		#$bc_vmax += 0.0005;
+		$bc_range = $bc_ceil - $bc_floor;
+		my $bd_0 = sprintf('%0.0f;%+0.1f', 100 *($bv_0 - $bc_floor) / $bc_range, 1000 * ($bv_0 - $res->{bc_vavg}->{avg}) );
+		my $bd_1 = sprintf('%0.0f;%+0.1f', 100 *($bv_1 - $bc_floor) / $bc_range, 1000 * ($bv_1 - $res->{bc_vavg}->{avg}) );
+		my $bd_2 = sprintf('%0.0f;%+0.1f', 100 *($bv_2 - $bc_floor) / $bc_range, 1000 * ($bv_2 - $res->{bc_vavg}->{avg}) );
+
+		#print "mux: $brick_mux 1: $bd_0 2: $bd_1 3: $bd_2  min: $bc_vmin max: $bc_vmax\n";
+		send_mqtt('ui',sprintf("brick_%d",$cid_start + 0),$bd_0 );
+		send_mqtt('ui',sprintf("brick_%d",$cid_start + 1),$bd_1);
+		send_mqtt('ui',sprintf("brick_%d",$cid_start + 2),$bd_2);
+
+		#Average
+		$brick_sum += $bv_0 + $bv_1 + $bv_2;
+		$brick_cnt += 3;
+
+		if ($brick_mux == 0) {
+			$brick_sum /= $brick_cnt;
+			$res->{bc_vavg}->{avg} = sprintf("%0.3f",$brick_sum);
+			$brick_sum = 0;
+			$brick_cnt = 0;
+			#print "brick avg: $res->{bc_vavg}->{avg} min:  $bc_vmin max: $bc_vmax\n";
+			my $bc_vminus =  1000 * ($res->{bc_vavg}->{avg} - $bc_vmin);
+			my $bc_vplus = 1000 * ($bc_vmax - $res->{bc_vavg}->{avg}) ;
+			$bc_vplus = 0 if $bc_vplus < 0.2;
+			$bc_vminus = 0 if $bc_vminus < 0.2;
+			send_mqtt('ui',"bc_vminus",$bc_vminus);
+			send_mqtt('ui',"bc_vplus", $bc_vplus);
+		}
+	}
+
+
+}
+
 when('473') { #UI Wake Reasons
 	#print "ID 541: $data_txt\n";
 	my $ui_gts =  getbits($dbin,'0|1@1+ (1,0)'); #going to sleep
@@ -937,7 +1117,7 @@ when('473') { #UI Wake Reasons
 	#print "gts: $ui_gts wr: $ui_wr\n";
 	$res->{ui_gts}->{avg} = $ui_gts;
 	$res->{ui_r_wake}->{avg} = $ui_r_wake;
-	send_mqtt("ui_r_wt",$ui_wake_reasons->{$ui_r_wake});
+	send_mqtt('ui',"ui_r_wt",$ui_wake_reasons->{$ui_r_wake});
 	
 }
 
@@ -965,9 +1145,10 @@ sleep 1;
 } #External while true loop end
 
 
-sub getbits { # Get bit value from message, using DBC file format encoding.
+sub getbits {
 
-
+	#my $v = shift;
+	#my $mask = shift;
 	my ($v, $mask) = @_;
 
 	#print "Mask: $mask v: $v\n";
@@ -993,8 +1174,16 @@ sub getbits { # Get bit value from message, using DBC file format encoding.
 }
 
 sub send_mqtt { #Publish to local MQTT
+	#my $id  = shift;
+	#my $val = shift;
+	my ($top,$id,$val) = @_;
+	my $t = time();
 
-	my ($id,$val) = @_;
+	$mqtt_sent->{$top}->{$id} = 0 if !defined $mqtt_sent->{$top}->{$id};
+
+	return if ($t - $mqtt_sent->{$top}->{$id} < 0.01);
+	#print "$top $id: " . ($t - $mqtt_sent->{$top}->{$id}) . "\n";
+	$mqtt_sent->{$top}->{$id} = $t;
 
         $val /= 1000 if $id =~ /^(trip_driven|heat_hvac|evap_p)$/;
 	
@@ -1002,7 +1191,8 @@ sub send_mqtt { #Publish to local MQTT
 	
 	# 2 if undefined
 	my $prec_digits = $precision->{$id} // 2;
-	if ($val =~ /[0-9]+/) {
+	$prec_digits = 3 if $id =~ /^brick_/;
+	if ($val =~ /^[0-9\.-]+$/) {
 	$val = sprintf("%0.".$prec_digits."f", $val);
 
 	$val =~ s/(\.[1-9]*)0+$/\1/ if $id !~ /^(bat_kw.*|dis_kmh|cur_speed|rear_p|sys_heat_cur)$/;
@@ -1011,13 +1201,14 @@ sub send_mqtt { #Publish to local MQTT
         return if $val eq $sent->{$id};
         $sent->{$id} = $val;
 
-        $mqtt->retain($id => $val);
+        $mqtt->retain($top . '/' . $id => $val);
 }
 
-sub send_msg {  # Send message to owner via some custom channel. Customize this if needed.
+sub send_msg {
 
 	my $msg = shift;
-	system('echo', '/usr/bin/mosquitto_pub','-h','127.0.0.1','-t','/sbot/send_now','-m',$msg);
+	#print "sending msg |$msg|\n";
+	system('/usr/bin/mosquitto_pub','-h','127.0.0.1','-t','/sbot/send_now','-m',$msg);
 
 }
 sub savedata {
