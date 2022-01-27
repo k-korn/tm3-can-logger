@@ -8,5 +8,8 @@ MulticastDNS=yes
 IPMasquerade=yes
 DHCPServer=yes
 
+[Link]
+RequiredForOnline=no
+
 [DHCPServer]
 DNS=1.1.1.1 1.0.0.1

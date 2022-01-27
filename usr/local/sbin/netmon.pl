@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 # Huawei 3372 modem status monitor
-# © 2020 Korn
+# © 2022 Korn
 #  
 
 use Data::Dumper;
@@ -60,10 +60,10 @@ while (1) {
 $mh = api_get('monitoring/status');
 #print Dumper($mh);
 
-send_mqtt('modem_sig',$mh->{SignalIcon});
-send_mqtt('modem_sig_max',$mh->{maxsignal});
-send_mqtt('modem_state',$conn_state ->{$mh->{ConnectionStatus}});
-send_mqtt('modem_net',$net_type->{$mh->{CurrentNetworkType}});
+send_mqtt('ui/modem_sig',$mh->{SignalIcon});
+send_mqtt('ui/modem_sig_max',$mh->{maxsignal});
+send_mqtt('ui/modem_state',$conn_state ->{$mh->{ConnectionStatus}});
+send_mqtt('ui/modem_net',$net_type->{$mh->{CurrentNetworkType}});
 
 write_file('/dev/shm/modem_stats',"modem_sig: ".$mh->{SignalIcon}."
 modem_state: ".$mh->{ConnectionStatus}."
